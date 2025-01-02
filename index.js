@@ -28,6 +28,7 @@ async function run() {
     await client.connect();
 
     const menuCollection = client.db("bistroDB").collection("menu");
+    const cartsCollection = client.db("bistroDB").collection("carts");
  
 
 
@@ -37,10 +38,10 @@ async function run() {
         res.send(result)
     })
 
-    // total data count
-    app.get("/count", async(req,res) =>{
-      const count = await menuCollection.estimatedDocumentCount();
-      res.send({count})
+    app.post("/carts", async(req,res) =>{
+      const cartItem = req.body;
+      const result = await cartsCollection.insertOne(cartItem);
+      res.send(result)
     })
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
