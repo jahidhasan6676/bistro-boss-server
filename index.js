@@ -3,13 +3,22 @@ const app = express();
 const cors = require("cors");
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const formData = require('form-data');
+const Mailgun = require('mailgun.js');
+const mailgun = new Mailgun(formData);
+const axios = require('axios');
+const qs = require('querystring');
+const mg = mailgun.client({ username: 'api', key: process.env.MAIL_GUN_API_KEY || "8e2926b3bb7bfb341781fdd750b77139-d8df908e-e7b7cca0" });
+
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY)
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { resolveSoa } = require("dns");
 const port = process.env.PORT || 5000;
 
 // middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded());
 
 
 
@@ -33,6 +42,7 @@ async function run() {
     const cartsCollection = client.db("bistroDB").collection("carts");
     const usersCollection = client.db("bistroDB").collection("users");
     const paymentsCollection = client.db("bistroDB").collection("payments");
+    const sslPaymentsCollection = client.db("bistroDB").collection("sslPayments");
 
 
     // jwt related api
@@ -216,48 +226,66 @@ async function run() {
 
       try {
         const paymentIntent = await stripe.paymentIntents.create({
-            amount: amount,
-            currency: "usd",
-            payment_method_types: ['card']
+          amount: amount,
+          currency: "usd",
+          payment_method_types: ['card']
         });
 
         res.send({ clientSecret: paymentIntent.client_secret });
-    } catch (error) {
+      } catch (error) {
         res.status(500).send({ error: error.message });
-    }
+      }
     })
 
-    app.get("/payments/:email", verifyToken, async(req,res)=>{
+    app.get("/payments/:email", verifyToken, async (req, res) => {
       const email = req.params.email;
-      const query = {email: email};
-      if(req.params.email !== req.decoded.email){
-        return res.status(403).send({message: "forbidden access"})
+      const query = { email: email };
+      if (req.params.email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" })
       }
       const result = await paymentsCollection.find(query).toArray();
       res.send(result)
-    } )
+    })
 
-    
-    app.post('/payments', async(req,res) =>{
+
+    app.post('/payments', async (req, res) => {
       const payment = req.body;
       const paymentResult = await paymentsCollection.insertOne(payment);
 
       // delete each item from the cart
-      const query = {_id: {
-        $in: payment.cartIds.map(id => new ObjectId(id))
-      }}
+      const query = {
+        _id: {
+          $in: payment.cartIds.map(id => new ObjectId(id))
+        }
+      }
       const deleteResult = await cartsCollection.deleteMany(query);
-      res.send({paymentResult,deleteResult})
+
+      // send user email about payment confirmation
+      mg.messages.create('sandboxe6696673b53747cdb92311e602f6eab8.mailgun.org', {
+        from: "Excited User <mailgun@sandboxe6696673b53747cdb92311e602f6eab8.mailgun.org>",
+        to: ["jh18186676@gmail.com"],
+        subject: "Bistro Boss Order Confirmation",
+        text: "Testing some Mailgun awesomeness!",
+        html: `<div>
+          <h2>Thank you for your order</h2>
+          <h4>Your Transaction Id: <strong>${payment?.transactionId}</strong></h4>
+          <p>We would like to get your feedback about the food.</p>
+        </div>`
+      })
+        .then(msg => console.log(msg)) // logs response data
+        .catch(err => console.log(err)); // logs any error
+
+      res.send({ paymentResult, deleteResult })
     })
 
     // stats or analytics
-    app.get("/admin-stats", verifyToken, verifyAdmin, async(req,res) =>{
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
       const users = await usersCollection.estimatedDocumentCount();
       const menuItems = await menuCollection.estimatedDocumentCount();
       const orders = await paymentsCollection.estimatedDocumentCount();
       const result = await paymentsCollection.aggregate([
         {
-          $group:{
+          $group: {
             _id: null,
             totalRevenue: {
               $sum: '$price'
@@ -269,17 +297,17 @@ async function run() {
 
 
 
-      res.send({users,menuItems,orders,revenue})
+      res.send({ users, menuItems, orders, revenue })
     })
 
     // using aggregate pipeline
-    app.get("/order-stats", verifyToken,verifyAdmin, async(req,res) =>{
+    app.get("/order-stats", verifyToken, verifyAdmin, async (req, res) => {
       const result = await paymentsCollection.aggregate([
         {
           $unwind: '$menuItemIds'
         },
         {
-          $lookup:{
+          $lookup: {
             from: 'menu',
             localField: 'menuItemIds',
             foreignField: '_id',
@@ -290,14 +318,14 @@ async function run() {
           $unwind: '$menuItems'
         },
         {
-          $group:{
+          $group: {
             _id: '$menuItems.category',
-            quantity: {$sum: 1},
-            revenue: {$sum: '$menuItems.price'}
+            quantity: { $sum: 1 },
+            revenue: { $sum: '$menuItems.price' }
           }
         },
         {
-          $project:{
+          $project: {
             _id: 0,
             category: '$_id',
             quantity: '$quantity',
@@ -306,6 +334,115 @@ async function run() {
         }
       ]).toArray();
       res.send(result)
+    })
+
+    // ssl payment
+    app.post("/create-ssl-payment", async (req, res) => {
+      const payment = req.body;
+      const { menuItemsIds } = req.body;
+
+      const query = { _id: { $in: menuItemsIds} }
+
+      const result = await menuCollection.aggregate([
+        { $match: query },
+        {
+          $group: {
+            _id: null,
+            totalPrice: { $sum: "$price" }
+          }
+        }
+      ]).toArray();
+      console.log(result);
+
+      const totalPrice = result.length > 0 ? result[0].totalPrice : 0;
+      console.log("price", totalPrice);
+
+      const trxId = new ObjectId().toString();
+      payment.transactionId = trxId;
+
+      const initiate = {
+        store_id: "bistr679c4ee09efec",
+        store_passwd: "bistr679c4ee09efec@ssl",
+        total_amount: totalPrice,
+        currency: 'BDT',
+        tran_id: trxId,
+        success_url: 'http://localhost:5000/success-payment',
+        fail_url: 'http://localhost:5173/fail',
+        cancel_url: 'http://localhost:5173/cancel',
+        ipn_url: 'http://localhost:5000/ipn-success-payment',
+        shipping_method: 'Courier',
+        product_name: 'Computer.',
+        product_category: 'Electronic',
+        product_profile: 'general',
+        cus_name: 'Customer Name',
+        cus_email: `${payment?.email}`,
+        cus_add1: 'Dhaka',
+        cus_add2: 'Dhaka',
+        cus_city: 'Dhaka',
+        cus_state: 'Dhaka',
+        cus_postcode: 1000,
+        cus_country: 'Bangladesh',
+        cus_phone: '01711111111',
+        cus_fax: '01711111111',
+        ship_name: 'Customer Name',
+        ship_add1: 'Dhaka',
+        ship_add2: 'Dhaka',
+        ship_city: 'Dhaka',
+        ship_state: 'Dhaka',
+        ship_postcode: 1000,
+        ship_country: 'Bangladesh',
+      };
+      const iniResponse = await axios.post(
+        "https://sandbox.sslcommerz.com/gwprocess/v4/api.php",
+        qs.stringify(initiate),
+        {
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+          }
+        }
+      );
+
+      const saveData = await paymentsCollection.insertOne(payment);
+      const gatewayUrl = iniResponse?.data?.GatewayPageURL
+
+      //console.log("gatewayUrl:", gatewayUrl);
+      res.send({ gatewayUrl })
+
+    })
+
+    app.post("/success-payment", async (req, res) => {
+      const successPayment = req.body;
+      // console.log("payment success info", successPayment)
+
+      const { data } = await axios.get(`https://sandbox.sslcommerz.com/validator/api/validationserverAPI.php?val_id=${successPayment.val_id}&store_id=bistr679c4ee09efec&store_passwd=bistr679c4ee09efec@ssl`)
+
+      // validation
+      if (data.status !== 'VALID') {
+        return res.send({ message: 'Invalid payment' })
+      }
+
+      // update the payment
+      const updatePayment = await paymentsCollection.updateOne({ transactionId: data.tran_id }, {
+        $set: { status: "Success" }
+      })
+
+      const payment = await paymentsCollection.findOne({ transactionId: data.tran_id })
+      // console.log("payment", payment)
+
+      // delete each item from the cart
+      const query = {
+        _id: {
+          $in: payment.cartIds.map(id => new ObjectId(id))
+        }
+      }
+      const deleteResult = await cartsCollection.deleteMany(query);
+      // console.log(deleteResult)
+
+      res.redirect("http://localhost:5173/success")
+      console.log("payment is valid", data)
+      console.log("update status", updatePayment)
+
+
     })
 
     // Send a ping to confirm a successful connection
